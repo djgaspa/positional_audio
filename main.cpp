@@ -92,25 +92,21 @@ int main()
     });
 
     std::thread consumer([&] {
-        std::atomic_bool is_receiver_running {true};
         std::mutex m;
         using Lock = std::unique_lock<std::mutex>;
         JitterBuffer* jb = ::jitter_buffer_init(samples_per_frame);
-        std::thread receiver([&] {
-            asio::io_service io_service;
-            asio::ip::udp::socket s(io_service, asio::ip::udp::endpoint(asio::ip::udp::v4(), port));
-            std::vector<unsigned char> packet;
-            while (true) {
-                packet.resize(256);
-                asio::ip::udp::endpoint endpoint;
-                int timestamp;
-                std::array<asio::mutable_buffer, 2> receive_buffer {
-                    asio::buffer(&timestamp, sizeof(timestamp)),
-                            asio::buffer(packet)
-                };
-                const auto n = s.receive_from(receive_buffer, endpoint);
-                if (is_receiver_running == false)
-                    break;
+        asio::io_service io_service;
+        asio::ip::udp::socket s(io_service, asio::ip::udp::endpoint(asio::ip::udp::v4(), port));
+        asio::ip::udp::endpoint endpoint;
+        std::vector<unsigned char> packet;
+        int timestamp;
+        std::function<void()> start_read = [&] {
+            packet.resize(256);
+            std::array<asio::mutable_buffer, 2> receive_buffer = {
+                asio::buffer(&timestamp, sizeof(timestamp)),
+                asio::buffer(packet)
+            };
+            s.async_receive_from(receive_buffer, endpoint, [&] (std::error_code e, std::size_t n) {
                 packet.resize(n - 4);
                 JitterBufferPacket p;
                 p.data = (char*)packet.data();
@@ -119,7 +115,12 @@ int main()
                 p.timestamp = timestamp;
                 Lock l(m);
                 ::jitter_buffer_put(jb, &p);
-            }
+                start_read();
+            });
+        };
+        start_read();
+        std::thread receiver([&io_service] {
+            io_service.run();
         });
 
         auto* output_device = ::alcOpenDevice(nullptr);
@@ -186,13 +187,7 @@ int main()
                 }
             }
         }
-        is_receiver_running = false;
-        asio::io_service io_service;
-        asio::ip::udp::socket s(io_service, asio::ip::udp::v4());
-        s.connect(asio::ip::udp::endpoint(asio::ip::address::from_string("127.0.0.1"), port));
-        s.send(asio::buffer("EXIT"));
-        s.shutdown(asio::ip::tcp::socket::shutdown_send);
-        s.close();
+        io_service.stop();
         receiver.join();
         ::opus_decoder_destroy(dec);
         ALint state = AL_PLAYING;
