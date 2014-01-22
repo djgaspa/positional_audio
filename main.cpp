@@ -11,6 +11,7 @@
 #include <AL/al.h>
 #include <opus/opus.h>
 #include <speex/speex_jitter.h>
+#include <boost/date_time.hpp>
 #include <asio.hpp>
 
 int main()
@@ -119,10 +120,6 @@ int main()
                 start_read();
             });
         };
-        start_read();
-        std::thread receiver([&io_service] {
-            io_service.run();
-        });
 
         std::shared_ptr<ALCdevice> output_device(::alcOpenDevice(nullptr), [] (ALCdevice* dev) {
             if (::alcCloseDevice(dev) == ALC_FALSE)
@@ -152,47 +149,65 @@ int main()
         }
         ::alSourceQueueBuffers(src[0], buffers.size(), buffers.data());
         ::alSourcePlay(src[0]);
-        while (is_running) {
-            ALint n_buffers_processed = 0;
-            ::alGetSourcei(src[0], AL_BUFFERS_PROCESSED, &n_buffers_processed);
-            if (n_buffers_processed == 0) {
-                std::this_thread::sleep_for(frame_duration / 4);
-                continue;
-            }
-            std::vector<ALuint> processed_buffers(n_buffers_processed);
-            ::alSourceUnqueueBuffers(src[0], processed_buffers.size(), processed_buffers.data());
-            while (processed_buffers.empty() == false) {
-                std::array<unsigned char, 1024> data;
-                JitterBufferPacket p;
-                p.data = (char*)data.data();
-                p.len = data.size();
-                Lock l(m);
-                const bool is_missing = ::jitter_buffer_get(jb.get(), &p, samples_per_frame, nullptr) != JITTER_BUFFER_OK;
-                ::jitter_buffer_tick(jb.get());
-                l.unlock();
-                const unsigned char* ptr = is_missing ? nullptr : (unsigned char*)p.data;
-                const int size = is_missing ? 0 : p.len;
-                decoded_samples.resize(samples_per_frame);
-                const int ret = ::opus_decode(dec.get(), ptr, size, decoded_samples.data(), decoded_samples.size(), 0);
-                if (ret <= 0) {
-                    std::cerr << "Error decoding stream" << std::endl;
-                    continue;
+
+        asio::deadline_timer timer(io_service);
+        asio::io_service::strand player_strand(io_service);
+        std::function<void()> start_timer = [&] () {
+            const boost::posix_time::microseconds interval(std::chrono::duration_cast<std::chrono::microseconds>(frame_duration / 4).count());
+            timer.expires_from_now(interval);
+            auto task = player_strand.wrap([&] (std::error_code e) {
+                start_timer();
+                ALint n_buffers_processed = 0;
+                ::alGetSourcei(src[0], AL_BUFFERS_PROCESSED, &n_buffers_processed);
+                if (n_buffers_processed == 0)
+                return;
+                std::vector<ALuint> processed_buffers(n_buffers_processed);
+                ::alSourceUnqueueBuffers(src[0], processed_buffers.size(), processed_buffers.data());
+                while (processed_buffers.empty() == false) {
+                    std::array<unsigned char, 1024> data;
+                    JitterBufferPacket p;
+                    p.data = (char*)data.data();
+                    p.len = data.size();
+                    Lock l(m);
+                    const bool is_missing = ::jitter_buffer_get(jb.get(), &p, samples_per_frame, nullptr) != JITTER_BUFFER_OK;
+                    ::jitter_buffer_tick(jb.get());
+                    l.unlock();
+                    const unsigned char* ptr = is_missing ? nullptr : (unsigned char*)p.data;
+                    const int size = is_missing ? 0 : p.len;
+                    decoded_samples.resize(samples_per_frame);
+                    const int ret = ::opus_decode(dec.get(), ptr, size, decoded_samples.data(), decoded_samples.size(), 0);
+                    if (ret <= 0) {
+                        std::cerr << "Error decoding stream" << std::endl;
+                        continue;
+                    }
+                    decoded_samples.resize(ret);
+                    const auto i = processed_buffers.back();
+                    processed_buffers.pop_back();
+                    ::alBufferData(i, AL_FORMAT_MONO16, decoded_samples.data(), decoded_samples.size() * sizeof(short), sampling_frequency);
+                    ::alSourceQueueBuffers(src[0], 1, &i);
+                    ALint state = 0;
+                    ::alGetSourcei(src[0], AL_SOURCE_STATE, &state);
+                    if (state != AL_PLAYING) {
+                        std::cout << "Restarting play" << std::endl;
+                        ::alSourcePlay(src[0]);
+                    }
                 }
-                decoded_samples.resize(ret);
-                const auto i = processed_buffers.back();
-                processed_buffers.pop_back();
-                ::alBufferData(i, AL_FORMAT_MONO16, decoded_samples.data(), decoded_samples.size() * sizeof(short), sampling_frequency);
-                ::alSourceQueueBuffers(src[0], 1, &i);
-                ALint state = 0;
-                ::alGetSourcei(src[0], AL_SOURCE_STATE, &state);
-                if (state != AL_PLAYING) {
-                    std::cout << "Restarting play" << std::endl;
-                    ::alSourcePlay(src[0]);
-                }
-            }
-        }
+            });
+            timer.async_wait(task);
+        };
+
+        start_read();
+        start_timer();
+        std::array<std::thread, 2> thread_pool;
+        for (auto& t : thread_pool)
+            t = std::thread([&io_service] {
+                io_service.run();
+            });
+        while (is_running)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         io_service.stop();
-        receiver.join();
+        for (auto& t : thread_pool)
+            t.join();
         ALint state = AL_PLAYING;
         while (state == AL_PLAYING) {
             std::this_thread::sleep_for(frame_duration);
