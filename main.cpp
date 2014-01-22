@@ -94,7 +94,8 @@ int main()
     std::thread consumer([&] {
         std::mutex m;
         using Lock = std::unique_lock<std::mutex>;
-        JitterBuffer* jb = ::jitter_buffer_init(samples_per_frame);
+        std::shared_ptr<JitterBuffer> jb(::jitter_buffer_init(samples_per_frame), &::jitter_buffer_destroy);
+
         asio::io_service io_service;
         asio::ip::udp::socket s(io_service, asio::ip::udp::endpoint(asio::ip::udp::v4(), port));
         asio::ip::udp::endpoint endpoint;
@@ -114,7 +115,7 @@ int main()
                 p.span = samples_per_frame;
                 p.timestamp = timestamp;
                 Lock l(m);
-                ::jitter_buffer_put(jb, &p);
+                ::jitter_buffer_put(jb.get(), &p);
                 start_read();
             });
         };
@@ -123,24 +124,27 @@ int main()
             io_service.run();
         });
 
-        auto* output_device = ::alcOpenDevice(nullptr);
+        std::shared_ptr<ALCdevice> output_device(::alcOpenDevice(nullptr), [] (ALCdevice* dev) {
+            if (::alcCloseDevice(dev) == ALC_FALSE)
+                std::cerr << "Error closing the output device" << std::endl;
+        });
         if (output_device == nullptr)
             std::cerr << "Error opening output device" << std::endl;
         //std::cout << "Output device: " << ::alcGetString(output_device, ALC_DEVICE_SPECIFIER) << std::endl;
-        auto* ctx = ::alcCreateContext(output_device, nullptr);
+        std::shared_ptr<ALCcontext> ctx(::alcCreateContext(output_device.get(), nullptr), &::alcDestroyContext);
         if (ctx == nullptr)
             std::cerr << "Error creating audio context " << ::alGetError() << std::endl;
-        ::alcMakeContextCurrent(ctx);
+        ::alcMakeContextCurrent(ctx.get());
         std::array<ALuint, 1> src;
         std::vector<ALuint> buffers(std::chrono::milliseconds(80) / frame_duration);
         ::alGenSources(src.size(), src.data());
         ::alGenBuffers(buffers.size(), buffers.data());
-        auto* dec = ::opus_decoder_create(sampling_frequency, 1, nullptr);
+        std::shared_ptr<OpusDecoder> dec(::opus_decoder_create(sampling_frequency, 1, nullptr), &::opus_decoder_destroy);
         if (dec == nullptr)
             std::cerr << "Error creating opus decoder" << std::endl;
         std::vector<short> decoded_samples(samples_per_frame);
         for (int i = 0; i < buffers.size(); ++i) {
-            const auto ret = ::opus_decode(dec, nullptr, 0, decoded_samples.data(), decoded_samples.size(), 0);
+            const auto ret = ::opus_decode(dec.get(), nullptr, 0, decoded_samples.data(), decoded_samples.size(), 0);
             if (ret <= 0) {
                 std::cerr << "Error initializing audio buffer: " << ret << " : " << ::opus_strerror(ret) << std::endl;
             }
@@ -163,13 +167,13 @@ int main()
                 p.data = (char*)data.data();
                 p.len = data.size();
                 Lock l(m);
-                const bool is_missing = ::jitter_buffer_get(jb, &p, samples_per_frame, nullptr) != JITTER_BUFFER_OK;
-                ::jitter_buffer_tick(jb);
+                const bool is_missing = ::jitter_buffer_get(jb.get(), &p, samples_per_frame, nullptr) != JITTER_BUFFER_OK;
+                ::jitter_buffer_tick(jb.get());
                 l.unlock();
                 const unsigned char* ptr = is_missing ? nullptr : (unsigned char*)p.data;
                 const int size = is_missing ? 0 : p.len;
                 decoded_samples.resize(samples_per_frame);
-                const int ret = ::opus_decode(dec, ptr, size, decoded_samples.data(), decoded_samples.size(), 0);
+                const int ret = ::opus_decode(dec.get(), ptr, size, decoded_samples.data(), decoded_samples.size(), 0);
                 if (ret <= 0) {
                     std::cerr << "Error decoding stream" << std::endl;
                     continue;
@@ -189,7 +193,6 @@ int main()
         }
         io_service.stop();
         receiver.join();
-        ::opus_decoder_destroy(dec);
         ALint state = AL_PLAYING;
         while (state == AL_PLAYING) {
             std::this_thread::sleep_for(frame_duration);
@@ -199,10 +202,6 @@ int main()
         ::alDeleteBuffers(buffers.size(), buffers.data());
         ::alDeleteSources(src.size(), src.data());
         ::alcMakeContextCurrent(nullptr);
-        ::alcDestroyContext(ctx);
-        if (::alcCloseDevice(output_device) == ALC_FALSE)
-            std::cerr << "Error closing the output device" << std::endl;
-        ::jitter_buffer_destroy(jb);
     });
 
     std::cin.get();
