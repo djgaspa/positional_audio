@@ -12,8 +12,8 @@
 #include <AL/al.h>
 #include <opus/opus.h>
 #include <speex/speex_jitter.h>
-#include <boost/date_time.hpp>
 #include <asio.hpp>
+#include <asio/high_resolution_timer.hpp>
 
 int main()
 {
@@ -146,11 +146,10 @@ int main()
             actors.emplace(id, p);
         };
 
-        asio::deadline_timer player_timer(io_service);
+        asio::high_resolution_timer player_timer(io_service);
         asio::io_service::strand player_strand(io_service);
         std::function<void()> start_timer = [&] () {
-            const boost::posix_time::microseconds interval(std::chrono::duration_cast<std::chrono::microseconds>(frame_duration / 4).count());
-            player_timer.expires_from_now(interval);
+            player_timer.expires_from_now(frame_duration / 4);
             auto player_task = player_strand.wrap([&] (std::error_code e) {
                 start_timer();
                 for (auto it : actors) {
@@ -206,13 +205,13 @@ int main()
         };
 
         asio::io_service::strand receiver_strand(io_service);
-        std::unordered_map<unsigned long long, std::shared_ptr<asio::deadline_timer>> timers(32);
+        std::unordered_map<unsigned long long, std::shared_ptr<asio::high_resolution_timer>> timers(32);
         auto start_deadline_timer = [&] (const unsigned long long id) {
             auto it = timers.find(id);
             if (it == timers.end())
-                it = timers.emplace(id, std::make_shared<asio::deadline_timer>(io_service)).first;
+                it = timers.emplace(id, std::make_shared<asio::high_resolution_timer>(io_service)).first;
             auto& t = *it->second;
-            t.expires_from_now(boost::posix_time::seconds(1));
+            t.expires_from_now(std::chrono::seconds(1));
             t.async_wait(receiver_strand.wrap([id, &m, &jitter_buffers, &timers] (std::error_code e) {
                 if (e == asio::error::operation_aborted)
                     return;
