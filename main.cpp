@@ -12,6 +12,7 @@
 #include <AL/al.h>
 #include <opus/opus.h>
 #include <speex/speex_jitter.h>
+#define ASIO_STANDALONE
 #include <asio.hpp>
 #include <asio/high_resolution_timer.hpp>
 
