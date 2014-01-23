@@ -213,11 +213,12 @@ int main()
                 it = timers.emplace(id, std::make_shared<asio::deadline_timer>(io_service)).first;
             auto& t = *it->second;
             t.expires_from_now(boost::posix_time::seconds(1));
-            t.async_wait(receiver_strand.wrap([id, &jitter_buffers, &timers] (std::error_code e) {
+            t.async_wait(receiver_strand.wrap([id, &m, &jitter_buffers, &timers] (std::error_code e) {
                 if (e == asio::error::operation_aborted)
                     return;
-                jitter_buffers.erase(id);
                 timers.erase(id);
+                Lock l(m);
+                jitter_buffers.erase(id);
             }));
         };
 
