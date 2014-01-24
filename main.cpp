@@ -1,117 +1,23 @@
 #include <iostream>
-#include <vector>
-#include <array>
-#include <chrono>
-#include <thread>
-#include <atomic>
-#include <AL/alc.h>
-#include <AL/al.h>
-#include <opus/opus.h>
-#define ASIO_STANDALONE
-#include <asio.hpp>
+#include "AudioSender.hpp"
 #include "PositionalAudio.hpp"
 
 int main()
 {
-    const int sampling_frequency = 16000;
-    const auto frame_duration = std::chrono::milliseconds(20);
-    const auto sample_duration = std::chrono::nanoseconds(static_cast<int>(1e9 / sampling_frequency));
-    const auto samples_per_frame = frame_duration / sample_duration;
-    const int port = 40321;
-
-    std::atomic_bool is_producer_running {true};
-    auto producer_function = [&] {
-        const int bitrate = 16000;
-        asio::io_service io_service;
-        asio::ip::udp::socket s(io_service, asio::ip::udp::v4());
-        s.connect(asio::ip::udp::endpoint(asio::ip::address::from_string("127.0.0.1"), port));
-        auto* device = ::alcCaptureOpenDevice(nullptr, sampling_frequency, AL_FORMAT_MONO16, 2 * samples_per_frame);
-        if (device == nullptr) {
-            std::cerr << "Error opening input device" << std::endl;
-            return;
-        }
-        //std::cout << "Input device: " << ::alcGetString(device, ALC_CAPTURE_DEVICE_SPECIFIER) << std::endl;
-        using clock = std::chrono::high_resolution_clock;
-        const auto t0 = clock::now();
-        std::vector<short> samples(samples_per_frame);
-        std::vector<unsigned char> buffer;
-        auto* enc = ::opus_encoder_create(sampling_frequency, 1, OPUS_APPLICATION_VOIP, nullptr);
-        if (enc == nullptr)
-            std::cerr << "Error creating opus encoder" << std::endl;
-        ::opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate));
-        ::opus_encoder_ctl(enc, OPUS_SET_DTX(1));
-        ::opus_encoder_ctl(enc, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_WIDEBAND));
-        ::opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(10));
-        int dtx, vbr, complexity, max_bw, fec;
-        ::opus_encoder_ctl(enc, OPUS_GET_DTX(&dtx));
-        ::opus_encoder_ctl(enc, OPUS_GET_VBR(&vbr));
-        ::opus_encoder_ctl(enc, OPUS_GET_COMPLEXITY(&complexity));
-        ::opus_encoder_ctl(enc, OPUS_GET_MAX_BANDWIDTH(&max_bw));
-        ::opus_encoder_ctl(enc, OPUS_GET_INBAND_FEC(&fec));
-        std::cout << "DTX: " << (dtx == 0 ? "NO" : "YES") << std::endl;
-        std::cout << "VBR: " << (vbr == 0 ? "NO" : "YES") << std::endl;
-        std::cout << "Complexity: " << complexity << std::endl;
-        std::cout << "Max Bandwidth: " << max_bw << std::endl;
-        std::cout << "FEC: " << (fec == 0 ? "NO" : "YES") << std::endl;
-        int n = 0;
-        ::alcCaptureStart(device);
-        unsigned timestamp = 0;
-        while (is_producer_running == true) {
-            ::ALCint count = 0;
-            ::alcGetIntegerv(device, ALC_CAPTURE_SAMPLES, 1, &count);
-            if (count < samples_per_frame) {
-                std::this_thread::sleep_for(frame_duration / 4);
-                continue;
-            }
-            ::alcCaptureSamples(device, samples.data(), samples_per_frame);
-            buffer.resize(256);
-            const int ret = ::opus_encode(enc, samples.data(), samples_per_frame, buffer.data(), buffer.size());
-            if (ret < 0)
-                std::cerr << "Error encoding" << std::endl;
-            if (ret > 1) {
-                n += ret;
-                buffer.resize(ret);
-                std::array<asio::const_buffer, 2> send_buffer {
-                    asio::buffer(&timestamp, sizeof(timestamp)),
-                            asio::buffer(buffer)
-                };
-                s.send(send_buffer);
-            }
-            timestamp += samples_per_frame;
-        }
-        ::alcCaptureStop(device);
-        const auto t1 = clock::now();
-        const double t = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() / 1000.0;
-        std::cout << "Time: " << t << std::endl;
-        std::cout << "Bandwidth: " << n * 8 / t << " bps" << std::endl;
-        ::opus_encoder_destroy(enc);
-        if (::alcCaptureCloseDevice(device) == ALC_FALSE)
-            std::cerr << "Error closing the device" << std::endl;
-    };
-    std::thread producer(producer_function);
-
+    AudioSender sender;
+    sender.start();
     PositionalAudio receiver;
     receiver.start();
 
     while (std::cin) {
         std::string command;
         std::getline(std::cin, command);
-        if (command == "pause" && is_producer_running == true) {
-            is_producer_running = false;
-            producer.join();
-        }
-        else if (command == "rec" && is_producer_running == false) {
-            is_producer_running = true;
-            producer = std::thread(producer_function);
-        }
-        else if (command == "") {
-            if (is_producer_running) {
-                is_producer_running = false;
-                producer.join();
-            }
-            receiver.stop();
+        if (command == "pause")
+            sender.stop();
+        else if (command == "rec")
+            sender.start();
+        else if (command == "")
             break;
-        }
         else
             std::cout << "Unknown command" << std::endl;
     }
