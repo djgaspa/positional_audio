@@ -3,7 +3,6 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
-#define ASIO_STANDALONE
 #include <asio.hpp>
 #include <asio/high_resolution_timer.hpp>
 #include <AL/alc.h>

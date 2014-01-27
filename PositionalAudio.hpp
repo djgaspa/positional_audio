@@ -1,7 +1,6 @@
 #pragma once
 #include <atomic>
 #include <thread>
-#define ASIO_STANDALONE
 #include <asio/io_service.hpp>
 #include <asio/strand.hpp>
 
