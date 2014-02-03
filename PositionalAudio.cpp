@@ -4,20 +4,18 @@
 #include <thread>
 #include <unordered_map>
 #include <asio.hpp>
-#include <asio/high_resolution_timer.hpp>
+#include <asio/steady_timer.hpp>
 #include <AL/alc.h>
 #include <AL/al.h>
 #include <opus/opus.h>
 #include <speex/speex_jitter.h>
 #include "PositionalAudio.hpp"
 
-void PositionalAudio::consumer()
+void PositionalAudio::consumer(const unsigned short port, const int sampling_frequency, const int frame_duration_ms)
 {
-    const int sampling_frequency = 16000;
-    const auto frame_duration = std::chrono::milliseconds(20);
+    const auto frame_duration = std::chrono::milliseconds(frame_duration_ms);
     const auto sample_duration = std::chrono::nanoseconds(static_cast<int>(1e9 / sampling_frequency));
     const auto samples_per_frame = frame_duration / sample_duration;
-    const int port = 40321;
 
     using Lock = std::unique_lock<std::mutex>;
     std::mutex m;
@@ -38,16 +36,20 @@ void PositionalAudio::consumer()
     struct Peer
     {
         std::array<ALuint, 1> src;
-        std::vector<ALuint> buffers;
+        std::vector<ALuint> buffers, available_buffers;
         std::vector<short> decoded_samples;
-        std::shared_ptr<OpusDecoder> dec{::opus_decoder_create(sampling_frequency, 1, nullptr), &::opus_decoder_destroy};
-        Peer(const int n_buffers, const int samples_per_frame) : buffers(n_buffers), decoded_samples(samples_per_frame) {
+        std::shared_ptr<OpusDecoder> dec;
+        Peer(const int freq, const int n_buffers) :
+            buffers(n_buffers), dec{::opus_decoder_create(freq, 1, nullptr), &::opus_decoder_destroy}
+        {
             if (dec == nullptr)
                 std::cerr << "Error creating opus decoder" << std::endl;
             ::alGenSources(src.size(), src.data());
             ::alGenBuffers(buffers.size(), buffers.data());
+            available_buffers = buffers;
         }
-        ~Peer() {
+        ~Peer()
+        {
             ::alDeleteBuffers(buffers.size(), buffers.data());
             ::alDeleteSources(src.size(), src.data());
         }
@@ -56,81 +58,93 @@ void PositionalAudio::consumer()
     std::unordered_map<unsigned long long, std::shared_ptr<Peer>> actors;
 
     auto init_actor = [&] (const unsigned long long id) {
-        auto p = std::make_shared<Peer>(std::chrono::milliseconds(80) / frame_duration, samples_per_frame);
-        for (int i = 0; i < p->buffers.size(); ++i) {
-            const auto ret = ::opus_decode(p->dec.get(), nullptr, 0, p->decoded_samples.data(), p->decoded_samples.size(), 0);
-            if (ret <= 0)
-                std::cerr << "Error initializing audio buffer: " << ret << " : " << ::opus_strerror(ret) << std::endl;
-            ::alBufferData(p->buffers[i], AL_FORMAT_MONO16, p->decoded_samples.data(), p->decoded_samples.size() * sizeof(short), sampling_frequency);
-        }
-        ::alSourceQueueBuffers(p->src[0], p->buffers.size(), p->buffers.data());
-        ::alSourcePlay(p->src[0]);
+        auto p = std::make_shared<Peer>(sampling_frequency, std::chrono::milliseconds(100) / frame_duration);
         actors.emplace(id, p);
     };
 
-    asio::high_resolution_timer player_timer(io_service);
+    using Clock = std::chrono::steady_clock;
+    asio::steady_timer player_timer(io_service, Clock::now());
     std::function<void()> start_player = [&] () {
         auto player_handler = [&] (std::error_code e) {
+            if (e == asio::error::operation_aborted)
+                return;
             start_player();
             for (auto it : actors) {
                 const auto id = it.first;
                 auto actor = it.second;
                 ALint n_buffers_processed = 0;
                 ::alGetSourcei(actor->src[0], AL_BUFFERS_PROCESSED, &n_buffers_processed);
-                if (n_buffers_processed == 0)
-                    return;
                 std::vector<ALuint> processed_buffers(n_buffers_processed);
                 ::alSourceUnqueueBuffers(actor->src[0], processed_buffers.size(), processed_buffers.data());
-                while (processed_buffers.empty() == false) {
-                    std::array<unsigned char, 1024> data;
-                    JitterBufferPacket p;
-                    p.data = (char*)data.data();
-                    p.len = data.size();
-                    Lock l(m);
-                    const auto jb_it = jitter_buffers.find(id);
-                    if (jb_it == jitter_buffers.end()) {
-                        ALint n_buffers_queued = 0;
-                        ::alGetSourcei(actor->src[0], AL_BUFFERS_QUEUED, &n_buffers_queued);
-                        if (n_buffers_queued == 0)
-                            actors.erase(id);
-                        return;
-                    }
-                    auto jb = jb_it->second;
-                    const bool is_missing = ::jitter_buffer_get(jb.get(), &p, samples_per_frame, nullptr) != JITTER_BUFFER_OK;
-                    ::jitter_buffer_tick(jb.get());
-                    l.unlock();
-                    const unsigned char* ptr = is_missing ? nullptr : (unsigned char*)p.data;
-                    const int size = is_missing ? 0 : p.len;
+                actor->available_buffers.insert(actor->available_buffers.end(), processed_buffers.begin(), processed_buffers.end());
+                std::array<unsigned char, 1024> data;
+                JitterBufferPacket p;
+                p.data = (char*)data.data();
+                p.len = data.size();
+                Lock l(m);
+                const auto jb_it = jitter_buffers.find(id);
+                if (jb_it == jitter_buffers.end()) {
+                    ALint n_buffers_queued = 0;
+                    ::alGetSourcei(actor->src[0], AL_BUFFERS_QUEUED, &n_buffers_queued);
+                    if (n_buffers_queued == 0)
+                        actors.erase(id);
+                    return;
+                }
+                auto jb = jb_it->second;
+                int timestamp;
+                const int get_ret = ::jitter_buffer_get(jb.get(), &p, samples_per_frame, &timestamp);
+                ::jitter_buffer_tick(jb.get());
+                l.unlock();
+                switch (get_ret) {
+                case JITTER_BUFFER_OK: {
                     actor->decoded_samples.resize(samples_per_frame);
-                    const int ret = ::opus_decode(actor->dec.get(), ptr, size, actor->decoded_samples.data(), actor->decoded_samples.size(), 0);
+                    const int ret = ::opus_decode(actor->dec.get(), (unsigned char*)p.data, p.len, actor->decoded_samples.data(), actor->decoded_samples.size(), 0);
                     if (ret <= 0) {
                         std::cerr << "Error decoding stream" << std::endl;
                         continue;
                     }
                     actor->decoded_samples.resize(ret);
-                    const auto i = processed_buffers.back();
-                    processed_buffers.pop_back();
-                    ::alBufferData(i, AL_FORMAT_MONO16, actor->decoded_samples.data(), actor->decoded_samples.size() * sizeof(short), sampling_frequency);
-                    ::alSourceQueueBuffers(actor->src[0], 1, &i);
-                    ALint state = 0;
-                    ::alGetSourcei(actor->src[0], AL_SOURCE_STATE, &state);
-                    if (state != AL_PLAYING) {
-                        std::cout << "Restarting play" << std::endl;
-                        ::alSourcePlay(actor->src[0]);
+                    break;
+                }
+                case JITTER_BUFFER_INSERTION:
+                case JITTER_BUFFER_MISSING: {
+                    actor->decoded_samples.resize(p.span);
+                    const int ret = ::opus_decode(actor->dec.get(), nullptr, p.span, actor->decoded_samples.data(), actor->decoded_samples.size(), 0);
+                    actor->decoded_samples.resize(ret);
+                    if (ret <= 0) {
+                        std::cerr << "Error decoding stream" << std::endl;
+                        continue;
                     }
+                    break;
+                }
+                default:
+                    std::cerr << "Critical error. Unknown value returned by jitter_buffer_get" << std::endl;
+                    continue;
+                }
+                if (actor->available_buffers.empty() == true) {
+                    continue;
+                }
+                const auto i = actor->available_buffers.back();
+                actor->available_buffers.pop_back();
+                ::alBufferData(i, AL_FORMAT_MONO16, actor->decoded_samples.data(), actor->decoded_samples.size() * sizeof(short), sampling_frequency);
+                ::alSourceQueueBuffers(actor->src[0], 1, &i);
+                ALint state = 0;
+                ::alGetSourcei(actor->src[0], AL_SOURCE_STATE, &state);
+                if (state != AL_PLAYING) {
+                    ::alSourcePlay(actor->src[0]);
                 }
             }
         };
-        player_timer.expires_from_now(frame_duration / 4);
+        player_timer.expires_at(player_timer.expires_at() + frame_duration);
         player_timer.async_wait(player_strand.wrap(player_handler));
     };
 
     asio::io_service::strand receiver_strand(io_service);
-    std::unordered_map<unsigned long long, std::shared_ptr<asio::high_resolution_timer>> timers(32);
+    std::unordered_map<unsigned long long, std::shared_ptr<asio::steady_timer>> timers(32);
     auto start_deadline_timer = [&] (const unsigned long long id) {
         auto it = timers.find(id);
         if (it == timers.end())
-            it = timers.emplace(id, std::make_shared<asio::high_resolution_timer>(io_service)).first;
+            it = timers.emplace(id, std::make_shared<asio::steady_timer>(io_service)).first;
         auto& t = *it->second;
         t.expires_from_now(std::chrono::seconds(1));
         t.async_wait(receiver_strand.wrap([id, &m, &jitter_buffers, &timers] (std::error_code e) {
@@ -217,7 +231,7 @@ void PositionalAudio::start()
     if (is_consumer_running)
         return;
     is_consumer_running = true;
-    t = std::thread(&PositionalAudio::consumer, this);
+    t = std::thread(&PositionalAudio::consumer, this, this->port, m_sampling_frequency, this->frame_duration_ms);
 }
 
 void PositionalAudio::stop()

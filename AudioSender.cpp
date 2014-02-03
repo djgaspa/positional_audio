@@ -13,24 +13,21 @@ AudioSender::~AudioSender()
     stop();
 }
 
-void AudioSender::run()
+void AudioSender::run(const std::string &address, const short port, const int sampling_frequency, const int frame_duration_ms, const int bitrate)
 {
-    const int sampling_frequency = 16000;
-    const auto frame_duration = std::chrono::milliseconds(20);
+    const auto frame_duration = std::chrono::milliseconds(frame_duration_ms);
     const auto sample_duration = std::chrono::nanoseconds(static_cast<int>(1e9 / sampling_frequency));
     const auto samples_per_frame = frame_duration / sample_duration;
-    const int port = 40321;
-    const int bitrate = 16000;
     asio::io_service io_service;
     asio::ip::udp::socket s(io_service, asio::ip::udp::v4());
-    s.connect(asio::ip::udp::endpoint(asio::ip::address::from_string("127.0.0.1"), port));
-    auto* device = ::alcCaptureOpenDevice(nullptr, sampling_frequency, AL_FORMAT_MONO16, 2 * samples_per_frame);
+    s.connect(asio::ip::udp::endpoint(asio::ip::address::from_string(address), port));
+    auto* device = ::alcCaptureOpenDevice(nullptr, sampling_frequency, AL_FORMAT_MONO16, 1000 * samples_per_frame);
     if (device == nullptr) {
         std::cerr << "Error opening input device" << std::endl;
         return;
     }
     //std::cout << "Input device: " << ::alcGetString(device, ALC_CAPTURE_DEVICE_SPECIFIER) << std::endl;
-    using clock = std::chrono::high_resolution_clock;
+    using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
     std::vector<short> samples(samples_per_frame);
     std::vector<unsigned char> buffer;
@@ -55,11 +52,13 @@ void AudioSender::run()
     int n = 0;
     ::alcCaptureStart(device);
     unsigned timestamp = 0;
+    auto deadline = clock::now();
     while (is_running == true) {
+        deadline += frame_duration;
+        std::this_thread::sleep_until(deadline);
         ::ALCint count = 0;
-        ::alcGetIntegerv(device, ALC_CAPTURE_SAMPLES, 1, &count);
+        ::alcGetIntegerv(device, ALC_CAPTURE_SAMPLES, sizeof(count), &count);
         if (count < samples_per_frame) {
-            std::this_thread::sleep_for(frame_duration / 4);
             continue;
         }
         ::alcCaptureSamples(device, samples.data(), samples_per_frame);
@@ -93,7 +92,7 @@ void AudioSender::start()
     if (is_running == true)
         return;
     is_running = true;
-    t = std::thread(&AudioSender::run, this);
+    t = std::thread(&AudioSender::run, this, address, port, sampling_frequency, frame_duration_ms, bitrate);
 }
 
 void AudioSender::stop()
